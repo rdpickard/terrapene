@@ -1,0 +1,109 @@
+{
+  "$id": "",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "isbndb.com api book",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "book": {
+      "required": ["other_isbns","isbn","publish_date","binding","msrp","isbn13","title","authors","date_published","publisher", "synopsys","language", "image", "title_long", "edition", "dimensions", "pages"],
+      "type": "object",
+      "description": "",
+      "properties": {
+        "publisher": {
+          "type": "string",
+          "description": ""
+        },
+        "synopsys": {
+          "type": "string",
+          "description": ""
+        },
+        "language": {
+          "type": "string",
+          "description": ""
+        },
+        "image": {
+          "type": "string",
+          "description": "",
+          "format": "uri"
+        },
+        "title_long": {
+          "type": "string",
+          "description": ""
+        },
+        "edition": {
+          "type": "string",
+          "description": ""
+        },
+        "dimensions": {
+          "type": "string",
+          "description": ""
+        },
+        "pages": {
+          "type": "integer",
+          "description": ""
+        },
+        "date_published": {
+          "type": "string",
+          "description": "",
+          "format": "date-time"
+        },
+        "authors": {
+          "type": "array",
+          "description": "",
+          "items": {
+            "type": "string",
+            "description": ""
+          }
+        },
+        "title": {
+          "type": "string",
+          "description": ""
+        },
+        "isbn13": {
+          "type": "string",
+          "description": "",
+          "pattern" : "^(\\d{13}$)"
+        },
+        "msrp": {
+          "type": "string",
+          "description": ""
+        },
+        "binding": {
+          "type": "string",
+          "description": ""
+        },
+        "publish_date": {
+          "type": "string",
+          "description": "",
+          "format": "date-time"
+        },
+        "isbn": {
+          "type": "string",
+          "description": "",
+          "pattern": "\\d{10}"
+        },
+        "other_isbns": {
+          "type": "array",
+          "description": "",
+          "items": {
+            "type": "object",
+            "required": ["isbn", "binding"],
+            "additionalProperties": false,
+            "properties": {
+              "isbn": {
+                "type": "string",
+                "pattern": "^(\\d{10}|\\d{13})$",
+                "description": ""
+              },
+              "binding": {
+                "type": "string",
+                "description": ""
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

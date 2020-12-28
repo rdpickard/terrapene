@@ -7,33 +7,43 @@ __function__ = ""
 import os
 import re
 import logging
-from urllib.parse import urlparse
-import time
 import json
-from datetime import datetime
-import ipaddress
+import random
+import string
+import base64
 
 import requests
 import flask
 import flask_restful
 from flask_sqlalchemy import SQLAlchemy
+import flask_sqlalchemy_session
 import sqlalchemy
+import sqlalchemy.orm
 import flask_migrate
+
+import jsonschema
 
 application = flask.Flask(__name__)
 application.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:////tmp/test.db'
 db = SQLAlchemy(application)
+db_session_factory = sqlalchemy.orm.sessionmaker(bind=db.engine)
+db_scoped_session = flask_sqlalchemy_session.flask_scoped_session(db_session_factory, application)
 api = flask_restful.Api(application)
-migrate = flask_migrate.Migrate(application, db)
 
 isbndb_webservice_api_key = os.environ["ISBNDB_WEBSERVICE_API_KEY"]
+
+# Load the JSON schemas into objects for validating JSON objects later
+with open("json_schemas/isbndb_dot_com_api_book_jsonschema.json") as f:
+    isbndb_webservice_api_jsonschema_book = json.load(f)
 
 # TODO the check of API key should be moved into flask pre-flight functions
 if isbndb_webservice_api_key is None or len(isbndb_webservice_api_key) == 0:
     raise Exception("ISBNDB_WEBSERVICE_API_KEY not set")
 
+
 class RemoteServiceException(Exception):
     pass
+
 
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -83,7 +93,7 @@ class Prosoponym(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     is_pseudonym = db.Column(db.Boolean, unique=False, nullable=False, default=False)
     is_collective = db.Column(db.Boolean, unique=False, nullable=False, default=False)
-    style = db.Column(db.String(120), unique=False, nullable=False)
+    style = db.Column(db.String(120), unique=False, nullable=False, default="unknown")
     name = db.Column(db.String(2046), unique=False, nullable=False)
 
 
@@ -130,11 +140,19 @@ class BookEdition(db.Model):
     __tablename__ = 'book_edition'
     id = db.Column(db.Integer, primary_key=True)
 
-    name = db.Column(db.String(120), unique=False, nullable=True)
+    name = db.Column(db.String(256), unique=False, nullable=True)
+    name_long = db.Column(db.String(1024), unique=False, nullable=True)
+
+    logline = db.Column(db.String(1024), unique=False, nullable=True)
+
     isbn = db.Column(db.String(120), unique=False, nullable=True)
     isbn13 = db.Column(db.String(120), unique=False, nullable=True)
     isbn_unknown = db.Column(db.Boolean, unique=False, nullable=False, default=True)
     isbn_should_exist = db.Column(db.Boolean, unique=False, nullable=False, default=True)
+
+    published_exact_day_utc = db.Column(db.DateTime(timezone=True), unique=False, nullable=True)
+    published_estimated_range_start_day_utc = db.Column(db.DateTime(timezone=True), unique=False, nullable=True)
+    published_estimated_range_end_day_utc = db.Column(db.DateTime(timezone=True), unique=False, nullable=True)
 
     physical = db.Column(db.Boolean, unique=False, nullable=False, default=True)
 
@@ -157,6 +175,14 @@ class UserCollection():
     name = db.Column(db.String(120), unique=False, nullable=False)
 
 
+def gen_log_tag():
+    """
+    Generates a 8 character string of a mix of upper case letters and digits to be used in log messages
+    :return: Eight character long string
+    """
+    return ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+
+
 def normalize_isbn(isbn):
     """
     Strip out any separators between numbers as well as leading or trailing padding from an ISBN
@@ -171,48 +197,95 @@ def normalize_isbn(isbn):
         raise ValueError("ISBN string must be 10 or 13 digits long. Value '{}' has {}digits".format(digits_only, len(digits_only)))
 
 
-def book_by_isbn(normalized_isbn, create_on_missing=True):
+def book_by_isbn_from_isbndb_dot_com(normalized_isbn, db_session, logger=logging.getLogger()):
     """
     Looks up a book or creates a new book by ISBN of a book edition and back fills the story and author
     :param normalized_isbn: The ISBN or ISBN13 of the book edition
-    :param create_on_missing: If the ISBN does not exist try to create an entry.
-    :return: The database ID of the book edition. If ISBN does not exist in db and create_on_missing is False, return None
+    :param db_session: The sqlalchemy session to use to access local database
+    :return: The database ID of the book edition. If no book with provided ISBN can be found return None
     :raises ValueError: If value normalized_isbn hasn't be normalized
     """
 
-    if normalized_isbn != normalize_isbn(normalized_isbn):
-        raise ValueError("ISBN has not been normalized before passing to book_by_isbn function. Needs to be normalized first")
+    log_tag = gen_log_tag()
+    logger.debug("[log_tag:{}][isbn:{}] book_by_isbn_from_isbndb_dot_com called".format(log_tag, normalized_isbn))
 
-    # Look up the ISBN in the local database,
-    # -if none present and create_on_missing is False return None otherwise move on
-    # -if one is present return the local database id of the book edition
-    # -if none is present create_on_missing is True move on to createing a local entry
+    not_normalized_error_msg = "ISBN has not been normalized before passing to book_by_isbn function. Needs to be normalized first [log_tag:{}]".format(log_tag)
+    try:
+        if normalized_isbn != normalize_isbn(normalized_isbn):
+            logger.info("[log_tag:{}][isbn:{}] Rejected isbn, wasn't normalized".format(log_tag, normalized_isbn))
+            raise ValueError(not_normalized_error_msg)
+    except ValueError:
+        logger.info("[log_tag:{}][isbn:{}] Rejected isbn, wasn't well formatted".format(log_tag, normalized_isbn))
+        raise ValueError(not_normalized_error_msg)
+
+    # Look up the ISBN in the local database, if one is present return the local database id of the book edition
+
     book_edition = db.session.query(BookEdition).filter((BookEdition.isbn == normalized_isbn) | (BookEdition.isbn13 == normalized_isbn)).first()
-    if book_edition is None and not create_on_missing:
-        return None
-    elif book_edition is not None:
+    if book_edition is not None:
+        logger.debug("[log_tag:{}][isbn:{}] in local db".format(log_tag, normalized_isbn))
         return book_edition.id
+    logger.debug("[log_tag:{}][isbn:{}] NOT in local db".format(log_tag, normalized_isbn))
 
     # Look up the ISBN in the ISBN database service to get data to be used in local creation
+    logger.debug("[log_tag:{}][isbn:{}] book_by_isbn_from_isbndb_dot_com api lookup request".format(log_tag, normalized_isbn))
     isbndb_response = requests.get("https://api2.isbndb.com/book/{}".format(normalized_isbn),
                                    headers={'Authorization': isbndb_webservice_api_key})
+    logger.debug("[log_tag:{}][isbn:{}] book_by_isbn_from_isbndb_dot_com api lookup response {}".format(log_tag, normalized_isbn, isbndb_response.status_code))
 
-    if isbndb_response.status_code != 200:
-        raise RemoteServiceException("isbndb responded with code {}".format(isbndb_response.status_code))
+    if isbndb_response.status_code == 404:
+        logger.info("[log_tag:{}][isbn:{}] Web service isbndb.com api returned 404 for ISBN".format(log_tag, normalized_isbn))
+        return None
+    elif isbndb_response.status_code != 200:
+        logger.warning("[log_tag:{}][isbn:{}] Web service isbndb.com api returned unhandled response code '{}' for ISBN".format(log_tag, normalized_isbn, isbndb_response.status_code))
+        raise RemoteServiceException("Remote service isbndb responded with code {}. [log_tag:{}]".format(isbndb_response.status_code, log_tag))
+    try:
+        jsonschema.validate(isbndb_response.json(), isbndb_webservice_api_jsonschema_book)
+    except jsonschema.exceptions.ValidationError as ve:
+        logger.error("[log_tag:{}][isbn:{}] Validation of isbndb.com web service api return JSON of ISBN failed".format(log_tag, normalized_isbn))
+        logger.error("[log_tag:{}][isbn:{}] validation failure msg(b64): {}".format(log_tag, normalized_isbn, base64.b64encode(str(ve).encode('ascii'))))
+        logger.debug("[log_tag:{}][isbn:{}] validation failure msg: \n{}".format(log_tag, normalized_isbn, str(ve)))
+        raise RemoteServiceException("Remote service isbndb api response did not send JSON in expected format. JSON schema validation failed [log_tag:{}]".format(log_tag))
+    isbndb_book = isbndb_response.json()
 
-    print(isbndb_response.json())
+    # Create a story edition of the story based on the book name
+    story = Story(name=isbndb_book["book"]["title"])
+    db_session.add(story)
+    db_session.commit()
 
-    # Create a default story for the book based on the book name
-
-    # Create a story edition of the story
+    story_edition = StoryEdition(story_id=story.id, story_edition_language=isbndb_book["book"]["language"])
+    db_session.add(story_edition)
+    db_session.commit()
 
     # Create a author for the story
+    author_prosoponym_ids = list()
+    for author in isbndb_book["book"]["authors"]:
+        name = Prosoponym(name=author)
+        person = Person()
+        db_session.add(name)
+        db_session.add(person)
+        db_session.commit()
+
+        name_to_person = NamesAssociation(prosoponym_id=name.id, person_id=person.id)
+        db_session.add(name_to_person)
+        db_session.commit()
+        author_prosoponym_ids.append(name.id)
 
     # Associate the story with the author
+    for author_prosoponym_id in author_prosoponym_ids:
+        db_session.add(StoryEditionPersonAssociation(prosoponym_id=author_prosoponym_id,
+                                                     story_edition_id=story_edition.id,
+                                                     contribution="author"))
+    db_session.commit()
 
     # Associate the story edition with the book edition
+    book_edition = BookEdition(isbn13=isbndb_book["book"]["isbn13"], isbn=isbndb_book["book"]["isbn"])
+    db_session.add(book_edition)
+    db_session.commit()
 
-    # Return the book edition for the ISBN
+    db_session.add(StoryEditionBookEditionAssociation(story_edition_id=story_edition.id,
+                                                      book_edition_id=book_edition.id))
+
+    return book_edition.id
 
 @application.before_first_request
 def pre_first_request():
@@ -242,56 +315,15 @@ def send_media(path):
 
 
 if __name__ == "__main__":
-    os.remove("/tmp/test.db")
+    # if os.path.exists("/tmp/test.db"):
+    #    os.remove("/tmp/test.db")
     db.create_all()
 
-    """
-    # Create a book
-    name = Prosoponym(name="William Gibson", style="anglo")
-    db.session.add(name)
-    person = Person()
-    db.session.add(person)
-    db.session.commit()
+    application.debug = True
 
-    name_to_person = NamesAssociation(prosoponym_id=name.id, person_id=person.id)
-    db.session.add(name_to_person)
-
-    story = Story(name="Pattern Recognition")
-    db.session.add(story)
-    db.session.commit()
-
-    story_edition_english = StoryEdition(story_id=story.id, story_edition_language="english")
-    story_edition_french = StoryEdition(story_id=story.id, story_edition_language="french",
-                                        story_edition_name="IDENTIFICATION DES SCHEMAS")
-    db.session.add(story_edition_english)
-    db.session.commit()
-
-    db.session.add(story_edition_french)
-    db.session.commit()
-
-    english_author = StoryEditionPersonAssociation(prosoponym_id=name.id, story_edition_id=story_edition_english.id,
-                                                   contribution="author")
-    french_author = StoryEditionPersonAssociation(prosoponym_id=name.id, story_edition_id=story_edition_french.id,
-                                                  contribution="author")
-    db.session.add(english_author)
-    db.session.add(french_author)
-    db.session.commit()
-
-    book_edition_english = BookEdition(isbn13="0425192938")
-    book_edition_french = BookEdition(isbn13="9782846260725")
-    db.session.add(book_edition_english)
-    db.session.add(book_edition_french)
-    db.session.commit()
-
-    e1 = StoryEditionBookEditionAssociation(story_edition_id=story_edition_french.id,
-                                            book_edition_id=book_edition_french.id)
-    e2 = StoryEditionBookEditionAssociation(story_edition_id=story_edition_english.id,
-                                            book_edition_id=book_edition_english.id)
-    db.session.add(e1)
-    db.session.add(e2)
-
-    db.session.commit()
-    """
-    book_by_isbn("0425192938")
-
+    try:
+        book_id = book_by_isbn_from_isbndb_dot_com("0425192938", db.session, logger=application.logger)
+    except RemoteServiceException as rse:
+        application.logger.error(rse)
+    print(book_id)
     application.run()
